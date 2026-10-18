@@ -16,7 +16,7 @@ $descendant = $null
 try {
     Copy-Item -LiteralPath (Join-Path $sourceDirectory 'Start-Endfield-Elevated.ps1') -Destination $testDirectory
     $fakeMain = @'
-param([switch]$StopLastRun)
+param()
 $ErrorActionPreference = 'Stop'
 $argsText = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $PSScriptRoot 'SleepChild.ps1') + '"'
 $mock = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $argsText -WindowStyle Hidden -PassThru

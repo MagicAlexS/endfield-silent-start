@@ -12,13 +12,7 @@ internal static class EndfieldSilentStart
         try
         {
             string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
-            bool stopLastRun = false;
-
-            if (args.Length == 1 && string.Equals(args[0], "-StopLastRun", StringComparison.OrdinalIgnoreCase))
-            {
-                stopLastRun = true;
-            }
-            else if (args.Length != 0)
+            if (args.Length != 0)
             {
                 return 2;
             }
@@ -38,8 +32,7 @@ internal static class EndfieldSilentStart
 
             ProcessStartInfo startInfo = new ProcessStartInfo();
             startInfo.FileName = powershellPath;
-            startInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + QuoteArgument(runnerPath) +
-                (stopLastRun ? " -StopLastRun" : String.Empty);
+            startInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + QuoteArgument(runnerPath);
             startInfo.WorkingDirectory = baseDirectory;
             startInfo.UseShellExecute = false;
             startInfo.CreateNoWindow = true;

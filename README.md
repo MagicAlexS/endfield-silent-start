@@ -2,7 +2,7 @@
 
 Windows 上的《明日方舟：终末地》静默启动工具。官方启动器在隐藏桌面运行，游戏显示在当前桌面；完成启动后关闭本轮启动器并退出工具，保留游戏进程。
 
-提供 PowerShell 脚本和可自行编译的无控制台 EXE 入口。无控制台入口仍会显示 Windows UAC 提权提示。工具不写入日志文件，仅保存清理启动器所需的 JSON 状态。
+提供 PowerShell 脚本和可自行编译的无控制台 EXE 入口。无控制台入口仍会显示 Windows UAC 提权提示。运行信息只保存在内存中，不生成日志或状态文件，多次使用不会累积运行记录。
 
 ## 运行环境
 
@@ -72,18 +72,10 @@ EXE 运行时依赖同目录的 `Start-Endfield.ps1` 和 `HiddenDesktopNative.cs
 | `-TimeoutSeconds` | `60` | 等待启动器窗口的上限，5–300 秒 |
 | `-InitializationDelaySeconds` | `1` | 启动器窗口出现后的初始化等待，0–60 秒 |
 | `-GameWindowTimeoutSeconds` | `300` | 等待游戏窗口的上限，5–900 秒 |
-| `-StopLastRun` | 关闭 | 清理上一次运行记录的启动器进程 |
 
 游戏主窗口连续稳定显示 2 秒后立即清理启动器，不必等待超时上限。窗口暂未出现、查询暂时失败或存在多个候选窗口时，会在等待期限内重试。检测失败或超时也会清理本轮启动器，保留游戏进程。
 
-需要手动重试清理时，运行 `Stop-Launcher.cmd`，或使用：
-
-```powershell
-.\Start-Endfield.ps1 -StopLastRun
-.\EndfieldSilentStart.exe -StopLastRun
-```
-
-清理仅针对本轮记录且路径、创建时间及会话匹配的 `Launcher.exe`、`Games.exe`，不会递归结束进程树。状态文件为工具目录中的 `run-*.json` 与 `last-run.txt`；启动器全部退出后可删除。
+清理仅针对本轮在内存中记录且路径、创建时间及会话匹配的 `Launcher.exe`、`Games.exe`，不会递归结束进程树。退出后丢弃本轮运行信息。
 
 ## 工作原理
 
@@ -112,7 +104,7 @@ Start-Endfield.ps1
 HiddenDesktopNative.cs
 ```
 
-如需自定义路径，同时放置 `config.json`。本仓库仅发布源代码，不提交编译产物和运行状态。
+如需自定义路径，同时放置 `config.json`。本仓库仅发布源代码，不提交编译产物。
 
 ## 开发检查
 
@@ -120,6 +112,7 @@ HiddenDesktopNative.cs
 .\Start-Endfield.ps1 -CheckOnly
 .\Start-Endfield.ps1 -SelfTest
 .\tests\Test-Paths.ps1
+.\tests\Test-NoState.ps1
 .\tests\Test-ConsoleExit.ps1
 .\tests\Test-SilentStart.ps1
 ```

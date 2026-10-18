@@ -3,7 +3,6 @@
 param(
     [switch]$CheckOnly,
     [switch]$SelfTest,
-    [switch]$StopLastRun,
     [string]$InstallRoot = '',
     [string]$GamePath = '',
     [string]$GamesPath = '',
@@ -20,12 +19,10 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ToolDirectory = $PSScriptRoot
-$script:StatePointerPath = Join-Path $script:ToolDirectory 'last-run.txt'
 $script:SessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
 $script:ProcessQueryAccess = 0x1000
 $script:ProcessParentAccess = 0x00100000 -bor 0x0080 -bor 0x1000
 $script:RunState = $null
-$script:RunStatePath = $null
 $script:LauncherReference = $null
 $script:GamesReference = $null
 $script:VisibleDesktopReference = $null
@@ -36,13 +33,6 @@ function Write-Status([string]$Message) {
 
 function Write-RunStatus([string]$Message) {
     Write-Status $Message
-}
-
-function Save-RunState {
-    if (-not $script:RunStatePath -or -not $script:RunState) { return }
-    $json = ConvertTo-Json -InputObject $script:RunState -Depth 8
-    [System.IO.File]::WriteAllText($script:RunStatePath, $json, [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::WriteAllText($script:StatePointerPath, $script:RunStatePath, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Get-ConfigPathValue($Config, [string]$Name) {
@@ -167,38 +157,6 @@ function ConvertTo-Identity($Snapshot) {
     }
 }
 
-function Get-RecordedState {
-    if (-not (Test-Path -LiteralPath $script:StatePointerPath -PathType Leaf)) { return $null }
-    $path = [System.IO.File]::ReadAllText($script:StatePointerPath).Trim()
-    if (-not $path) { return $null }
-    $fullPath = [System.IO.Path]::GetFullPath($path)
-    $basePath = [System.IO.Path]::GetFullPath($script:ToolDirectory).TrimEnd('\') + '\'
-    if (-not $fullPath.StartsWith($basePath, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'The last-run state path is outside this tool directory; refusing to use it.'
-    }
-    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { return $null }
-    return (ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($fullPath)))
-}
-
-function Test-RecordedProcessLive($Identity) {
-    if (-not $Identity -or -not $Identity.ProcessId) { return $false }
-    $processRows = @(Get-SessionNamedProcesses | Where-Object { $_.ProcessId -eq [uint32]$Identity.ProcessId })
-    if ($processRows.Count -eq 0) { return $false }
-    $expectedPath = [string]$Identity.ImagePath
-    $expectedTime = [long]$Identity.CreationFileTimeUtc
-    try {
-        $reference = [HiddenDesktopNative]::OpenProcessRef([uint32]$Identity.ProcessId, $script:ProcessQueryAccess -bor 0x00100000)
-        try {
-            $snapshot = [HiddenDesktopNative]::ReadProcess($reference)
-            return ([HiddenDesktopNative]::IsRunning($reference) -and
-                $snapshot.CreationFileTimeUtc -eq $expectedTime -and
-                [string]::Equals([System.IO.Path]::GetFullPath($snapshot.ImagePath), [System.IO.Path]::GetFullPath($expectedPath), [StringComparison]::OrdinalIgnoreCase))
-        }
-        finally { $reference.Dispose() }
-    }
-    catch { throw "A recorded process identity is still named in this session but cannot be verified (PID $($Identity.ProcessId)); refusing to overwrite its state. $($_.Exception.Message)" }
-}
-
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -229,62 +187,6 @@ function Invoke-CheckOnly {
             Write-Status ("  {0} PID={1} PPID={2} Path={3}" -f $row.Name, $row.ProcessId, $row.ParentProcessId, $pathText)
         }
     }
-    $record = Get-RecordedState
-    if ($record) { Write-Status "Latest saved run state: $($record.RunId), status=$($record.Status); CheckOnly does not change it." }
-    return 0
-}
-
-function Invoke-StopLastRun {
-    Assert-64BitWindows
-    if (-not (Test-IsAdministrator)) { throw 'StopLastRun requires an elevated 64-bit PowerShell session. Run the .cmd file to request elevation.' }
-    $paths = Get-InstallPaths
-    $state = Get-RecordedState
-    if (-not $state) { throw 'There is no saved run state to clean up.' }
-    $allowed = @([System.IO.Path]::GetFullPath($paths.Launcher), [System.IO.Path]::GetFullPath($paths.Games))
-    $identities = @()
-    if ($state.PSObject.Properties.Name -contains 'GamesCandidates') { $identities += @($state.GamesCandidates) }
-    $identities += @($state.Games, $state.Launcher)
-    $seen = @{}
-    $cleanupFailed = $false
-    foreach ($identity in $identities) {
-        if (-not $identity -or -not $identity.ProcessId) { continue }
-        $key = '{0}:{1}' -f [uint32]$identity.ProcessId, [long]$identity.CreationFileTimeUtc
-        if ($seen.ContainsKey($key)) { continue }
-        $seen[$key] = $true
-        $path = [System.IO.Path]::GetFullPath([string]$identity.ImagePath)
-        if (-not ($allowed | Where-Object { [string]::Equals($_, $path, [StringComparison]::OrdinalIgnoreCase) })) {
-            Write-Status "Cleanup skipped PID=$($identity.ProcessId): recorded image path is outside the exact launcher/Games whitelist."
-            $cleanupFailed = $true
-            continue
-        }
-        if ([uint32]$identity.SessionId -ne [uint32]$script:SessionId) {
-            Write-Status "Cleanup skipped PID=$($identity.ProcessId): recorded session does not match this PowerShell session."
-            $cleanupFailed = $true
-            continue
-        }
-        $rows = @(Get-SessionNamedProcesses | Where-Object { $_.ProcessId -eq [uint32]$identity.ProcessId })
-        if ($rows.Count -eq 0) {
-            Write-Status "Cleanup complete for PID=$($identity.ProcessId): the recorded process is no longer listed in this session."
-            continue
-        }
-        try {
-            $stopped = [HiddenDesktopNative]::StopVerifiedProcess([uint32]$identity.ProcessId, $path,
-                [long]$identity.CreationFileTimeUtc, [uint32]$identity.SessionId)
-            if ($stopped) {
-                Write-Status "Stopped the recorded official process PID=$($identity.ProcessId), image=$path."
-            }
-            else {
-                Write-Status "Cleanup could not confirm PID=$($identity.ProcessId): path, creation time, or session no longer matches the saved identity."
-                $cleanupFailed = $true
-            }
-        }
-        catch { Write-Status "Cleanup could not verify/stop PID=$($identity.ProcessId): $($_.Exception.Message)"; $cleanupFailed = $true }
-    }
-    if ($cleanupFailed) {
-        Write-Status 'One or more recorded Launcher.exe/Games.exe identities could not be confirmed exited; Endfield.exe was left untouched.'
-        return 1
-    }
-    Write-Status 'Cleanup confirmed for every recorded Launcher.exe/Games.exe identity; Endfield.exe was left untouched.'
     return 0
 }
 
@@ -513,19 +415,10 @@ function Write-CleanupNote([string]$Message) {
     }
 }
 
-function Save-CleanupState {
-    try { Save-RunState }
-    catch {
-        try { $script:RunState.CleanupErrors += ('Cleanup state write failed: ' + $_.Exception.Message) } catch { }
-    }
-}
-
 function Invoke-ThisRunProcessCleanup($Paths) {
     if ($script:RunState.CleanupAttempted) { return [bool]$script:RunState.CleanupComplete }
     $script:RunState.CleanupAttempted = $true
-    $script:RunState.CleanupResults = @()
     $script:RunState.CleanupErrors = @()
-    Save-CleanupState
     Write-CleanupNote "Cleaning up only this run's verified Launcher.exe and Games.exe identities; Endfield.exe is left running."
 
     $launcherIdentity = $script:RunState.Launcher
@@ -550,8 +443,6 @@ function Invoke-ThisRunProcessCleanup($Paths) {
         Write-CleanupNote $script:RunState.CleanupErrors[-1]
     }
     $script:RunState.LauncherCleanupConfirmed = [bool]$launcherOk
-    $script:RunState.CleanupResults += [pscustomobject]@{ Name = 'Launcher.exe'; ConfirmedExited = [bool]$launcherOk }
-    Save-CleanupState
 
     $gameIdentities = @()
     if ($script:RunState.GamesCandidates) { $gameIdentities += @($script:RunState.GamesCandidates) }
@@ -571,7 +462,6 @@ function Invoke-ThisRunProcessCleanup($Paths) {
                 $stopped = Stop-ThisRunProcess $reference $identity $Paths.Games ('Games.exe PID=' + $identity.ProcessId)
             }
             else { $stopped = Stop-RecordedRunProcess $identity $Paths.Games ('Games.exe PID=' + $identity.ProcessId) }
-            $script:RunState.CleanupResults += [pscustomobject]@{ Name = 'Games.exe'; ProcessId = [uint32]$identity.ProcessId; ConfirmedExited = [bool]$stopped }
             if (-not $stopped) { $gamesOk = $false }
         }
         catch {
@@ -579,12 +469,10 @@ function Invoke-ThisRunProcessCleanup($Paths) {
             $script:RunState.CleanupErrors += ('Games.exe PID=' + $identity.ProcessId + ' cleanup error: ' + $_.Exception.Message)
             Write-CleanupNote $script:RunState.CleanupErrors[-1]
         }
-        Save-CleanupState
     }
 
     $script:RunState.GamesCleanupConfirmed = [bool]$gamesOk
     $script:RunState.CleanupComplete = [bool]($launcherOk -and $gamesOk)
-    Save-CleanupState
     if (-not $script:RunState.CleanupComplete) {
         Write-CleanupNote 'Cleanup did not confirm every recorded launcher process exited; the run will finish with a failure status.'
     }
@@ -595,7 +483,6 @@ function Complete-GameLaunch($Paths, $GameReference, $GameInfo, $GameWindowHandl
     try {
         if (-not [HiddenDesktopNative]::IsRunning($GameReference)) {
             $script:RunState.Status = 'GameExitedBeforeCleanup'
-            Save-RunState
             throw 'Endfield exited before cleanup validation.'
         }
         $currentGame = [HiddenDesktopNative]::ReadProcess($GameReference)
@@ -605,13 +492,11 @@ function Complete-GameLaunch($Paths, $GameReference, $GameInfo, $GameWindowHandl
             -not [string]::Equals([System.IO.Path]::GetFullPath($currentGame.ImagePath), [System.IO.Path]::GetFullPath($Paths.Game), [StringComparison]::OrdinalIgnoreCase) -or
             $currentGame.ParentProcessId -ne [uint32]$script:RunState.ExpectedParentProcessId) {
             $script:RunState.Status = 'GameIdentityChangedBeforeCleanup'
-            Save-RunState
         throw 'Endfield identity or parent PID changed before cleanup validation.'
         }
         $finalScan = [HiddenDesktopNative]::ReadGameWindowScan([uint32]$currentGame.ProcessId, $script:VisibleDesktopReference)
         if ($finalScan.Kind.ToString() -ne 'MainFound' -or $finalScan.Handle -ne $GameWindowHandle) {
             $script:RunState.Status = 'GameWindowChangedBeforeCleanup'
-            Save-RunState
             throw 'The same unique Endfield main window was not present during cleanup validation.'
         }
     }
@@ -619,41 +504,34 @@ function Complete-GameLaunch($Paths, $GameReference, $GameInfo, $GameWindowHandl
         if ($script:RunState.Status -notin @('GameExitedBeforeCleanup', 'GameIdentityChangedBeforeCleanup', 'GameWindowChangedBeforeCleanup')) {
             $script:RunState.Status = 'GameCleanupPrecheckFailed'
         }
-        Save-RunState
         throw
     }
 
     $script:RunState.Status = 'CleaningLauncherProcesses'
-    $script:RunState.GameWindowHandle = $GameWindowHandle.ToInt64()
-    Save-RunState
     Write-RunStatus "Endfield main window stayed valid on the same HWND for 2 seconds; cleaning up this run's official launcher processes."
     $cleanupComplete = Invoke-ThisRunProcessCleanup $Paths
 
     $gameStillRunning = $false
     try { $gameStillRunning = [HiddenDesktopNative]::IsRunning($GameReference) }
-    catch { $script:RunState.GameStateAfterCleanupError = $_.Exception.Message }
+    catch { }
     if (-not $gameStillRunning) {
         $script:RunState.Status = 'GameExitedDuringCleanup'
-        Save-RunState
         throw 'Endfield exited during launcher cleanup; the run is not marked complete.'
     }
 
     $launcherStillRunning = $true
     $gamesStillRunning = $true
     try { $launcherStillRunning = [HiddenDesktopNative]::IsRunning($script:LauncherReference) }
-    catch { $script:RunState.LauncherStateAfterCleanupError = $_.Exception.Message }
+    catch { }
     try { $gamesStillRunning = [HiddenDesktopNative]::IsRunning($script:GamesReference) }
-    catch { $script:RunState.GamesStateAfterCleanupError = $_.Exception.Message }
+    catch { }
 
     if (-not $cleanupComplete -or $launcherStillRunning -or $gamesStillRunning) {
         $script:RunState.Status = 'LauncherCleanupFailed'
-        Save-RunState
         throw "Endfield is running, but this run's Launcher.exe and Games.exe could not both be confirmed exited."
     }
 
     $script:RunState.Status = 'Completed'
-    $script:RunState.CompletedAt = (Get-Date).ToString('o')
-    Save-RunState
     Write-RunStatus "Endfield remains running and both this run's Launcher.exe and Games.exe are confirmed exited."
     return 0
 }
@@ -796,7 +674,6 @@ function Invoke-SelfTest {
         if (-not $visibleMatches) { throw 'SelfTest failed: the mock child did not create a window on the visible Default desktop.' }
         Write-Status 'SelfTest PASS: hidden mock parent, explicit PPID, and visible Default-desktop child were observed.'
 
-        $script:RunStatePath = $null
         $script:VisibleDesktopReference = $visibleDesktop
         $script:LauncherReference = $mockParent
         $script:GamesReference = $mockParent
@@ -836,7 +713,6 @@ function Invoke-SelfTest {
             LauncherLaunchAttempted = $true
             CleanupAttempted = $false
             CleanupComplete = $false
-            CleanupResults = @()
             CleanupErrors = @()
         }
         $mockPaths = [pscustomobject]@{ Launcher = $mockImage; Games = $mockImage; Game = $mockImage }
@@ -873,7 +749,6 @@ function Invoke-SelfTest {
             LauncherLaunchAttempted = $true
             CleanupAttempted = $false
             CleanupComplete = $false
-            CleanupResults = @()
             CleanupErrors = @()
         }
         $failureCleanupComplete = Invoke-ThisRunProcessCleanup $mockPaths
@@ -1028,7 +903,6 @@ function Wait-ForOfficialGames($Paths, [System.Collections.Generic.HashSet[uint3
                     $State.Games = ConvertTo-Identity $snapshot
                     $State.GamesCandidates = @($State.GamesCandidates) + @($State.Games)
                     $State.Status = 'OfficialGamesFound'
-                    Save-RunState
                     Write-RunStatus ("Discovered exact official Games.exe PID={0}; path and creation time were verified from an open process handle." -f $snapshot.ProcessId)
                 }
                 catch {
@@ -1049,35 +923,25 @@ function Wait-ForOfficialGames($Paths, [System.Collections.Generic.HashSet[uint3
                     $evidenceException = $_.Exception
                     if ($evidenceException.InnerException) { $evidenceException = $evidenceException.InnerException }
                     $lastDesktopEvidenceError = $evidenceException.Message
-                    $State.DesktopEvidenceLastError = $lastDesktopEvidenceError
-                    Save-RunState
                     if (-not $State.DesktopEvidenceRetryLogged) {
                         Write-RunStatus ("Window enumeration is not ready for Games.exe yet; retrying until the startup timeout. Error: {0}" -f $lastDesktopEvidenceError)
                         $State.DesktopEvidenceRetryLogged = $true
-                        Save-RunState
                     }
                     Start-Sleep -Milliseconds 200
                     continue
                 }
-                $State.GamesWindowThreadIds = @($evidence.WindowThreadIds)
-                $State.GamesWindowsOnHiddenDesktop = [int]$evidence.WindowsOnRequestedDesktop
-                $State.GamesWindowsOnDefaultDesktop = [int]$visibleEvidence.WindowsOnRequestedDesktop
-                Save-RunState
                 if ($visibleEvidence.WindowsOnRequestedDesktop -gt 0) {
                     $State.Status = 'GamesDesktopMismatch'
-                    Save-RunState
-                    throw "Official Games.exe owns a window on Default instead of staying on hidden desktop '$HiddenDesktopName'. No Endfield process was started; use -StopLastRun if you want to close only the recorded launcher/Games processes."
+                    throw "Official Games.exe owns a window on Default instead of staying on hidden desktop '$HiddenDesktopName'. No Endfield process was started."
                 }
                 if ($evidence.WindowThreadIds.Count -gt 0 -and $evidence.WindowsOnRequestedDesktop -gt 0) {
                     $State.Status = 'OfficialGamesOnHiddenDesktop'
-                    Save-RunState
                     return $item
                 }
             }
             Start-Sleep -Milliseconds 200
         }
         $State.Status = 'GamesDesktopEvidenceTimeout'
-        Save-RunState
         $timeoutMessage = "Timed out after $TimeoutSeconds seconds without a unique official Games.exe window/thread on hidden desktop '$HiddenDesktopName'. No Endfield process was started."
         if ($lastDesktopEvidenceError) { $timeoutMessage += " Last window enumeration error: $lastDesktopEvidenceError" }
         throw $timeoutMessage
@@ -1096,14 +960,6 @@ function Invoke-ActualRun {
     if (-not [string]::Equals($callerDesktop, 'Default', [StringComparison]::OrdinalIgnoreCase)) {
         throw "The caller is on desktop '$callerDesktop'; actual run requires WinSta0\Default so the game can be explicitly created on the visible desktop. No process was started."
     }
-    $oldState = Get-RecordedState
-    if ($oldState) {
-        foreach ($identity in @($oldState.Games, $oldState.Launcher)) {
-            if (Test-RecordedProcessLive $identity) {
-                throw "A process from saved run $($oldState.RunId) is still alive. Use -StopLastRun before starting another launch."
-            }
-        }
-    }
     $active = @(Get-SessionNamedProcesses)
     if ($active.Count -gt 0) {
         $details = @($active | ForEach-Object {
@@ -1114,34 +970,18 @@ function Invoke-ActualRun {
     }
 
     $runId = [Guid]::NewGuid().ToString('N')
-    $script:RunStatePath = Join-Path $script:ToolDirectory ('run-' + $runId + '.json')
     $hiddenName = 'HGEndfield-' + $runId.Substring(0, 16)
     $hiddenPath = [HiddenDesktopNative]::DesktopPath($hiddenName)
     $script:RunState = [ordered]@{
-        Schema = 1
-        RunId = $runId
-        CreatedAt = (Get-Date).ToString('o')
-        SessionId = $script:SessionId
-        CallerDesktop = $callerDesktop
-        HiddenDesktop = $hiddenName
         Launcher = $null
         Games = $null
         GamesCandidates = @()
-        GamesWindowThreadIds = @()
-        GamesWindowsOnHiddenDesktop = 0
-        GamesWindowsOnDefaultDesktop = 0
-        Game = $null
-        GameWindowWait = $null
-        GameWindowHandle = $null
-        GameWindowFinalValidationLastIssue = $null
-        DesktopEvidenceLastError = $null
         DesktopEvidenceRetryLogged = $false
         LauncherLaunchAttempted = $false
         CleanupAttempted = $false
         CleanupComplete = $false
         LauncherCleanupConfirmed = $false
         GamesCleanupConfirmed = $false
-        CleanupResults = @()
         CleanupErrors = @()
         Status = 'Starting'
     }
@@ -1161,20 +1001,17 @@ function Invoke-ActualRun {
         $launchUtc = [DateTime]::UtcNow
         Write-RunStatus "Starting root Launcher.exe on hidden desktop '$hiddenName' with official Endfield arguments."
         $script:RunState.LauncherLaunchAttempted = $true
-        Save-RunState
         $launcherRef = [HiddenDesktopNative]::StartProcessOnDesktop($paths.Launcher, '--game=endfield --reason=4', $paths.Root, $hiddenPath, $null, $true)
         $script:LauncherReference = $launcherRef
         $launcherSnapshot = [HiddenDesktopNative]::ReadProcess($launcherRef)
         $script:RunState.Launcher = ConvertTo-Identity $launcherSnapshot
         $script:RunState.Status = 'LauncherStarted'
-        Save-RunState
         if ($launcherSnapshot.SessionId -ne [uint32]$script:SessionId -or
             -not [string]::Equals([System.IO.Path]::GetFullPath($launcherSnapshot.ImagePath), [System.IO.Path]::GetFullPath($paths.Launcher), [StringComparison]::OrdinalIgnoreCase)) {
             $script:RunState.Status = 'LauncherIdentityMismatch'
-            Save-RunState
             throw 'Started Launcher.exe did not match the expected image path and session; no further launch action was taken.'
         }
-        Write-RunStatus ("Launcher created: PID={0}, path={1}, session={2}, creationUtc={3}; state saved before game launch." -f $launcherSnapshot.ProcessId, $launcherSnapshot.ImagePath, $launcherSnapshot.SessionId, [DateTime]::FromFileTimeUtc($launcherSnapshot.CreationFileTimeUtc).ToString('o'))
+        Write-RunStatus ("Launcher created: PID={0}, path={1}, session={2}, creationUtc={3}." -f $launcherSnapshot.ProcessId, $launcherSnapshot.ImagePath, $launcherSnapshot.SessionId, [DateTime]::FromFileTimeUtc($launcherSnapshot.CreationFileTimeUtc).ToString('o'))
         Write-RunStatus 'Waiting for one newly created exact-path Games.exe process and verifying its window-owning thread by enumerating both hidden and Default desktops.'
         $gamesItem = Wait-ForOfficialGames $paths $baselinePids $launchUtc $hiddenName $hiddenDesktop $visibleDesktop $script:RunState
         $script:GamesReference = $gamesItem.Reference
@@ -1190,10 +1027,6 @@ function Invoke-ActualRun {
         $finalDefaultEvidence = [HiddenDesktopNative]::ReadDesktopEvidence($parentInfo.ProcessId, $visibleDesktop)
         if ($finalDefaultEvidence.WindowsOnRequestedDesktop -gt 0 -or $finalGamesEvidence.WindowThreadIds.Count -lt 1) {
             $script:RunState.Status = 'GamesDesktopChangedDuringDelay'
-            $script:RunState.GamesWindowThreadIds = @($finalGamesEvidence.WindowThreadIds)
-            $script:RunState.GamesWindowsOnHiddenDesktop = [int]$finalGamesEvidence.WindowsOnRequestedDesktop
-            $script:RunState.GamesWindowsOnDefaultDesktop = [int]$finalDefaultEvidence.WindowsOnRequestedDesktop
-            Save-RunState
             throw 'Games.exe no longer has a window and thread on the hidden desktop after the initialization delay. No Endfield process was started.'
         }
         $gameDesktopPath = [HiddenDesktopNative]::DesktopPath($callerDesktop)
@@ -1202,44 +1035,31 @@ function Invoke-ActualRun {
         $gameRef = [HiddenDesktopNative]::StartProcessOnDesktop($paths.Game, $providedArguments, (Split-Path -Parent $paths.Game), $gameDesktopPath, $gamesItem.Reference, $false)
         if (-not [HiddenDesktopNative]::IsRunning($gameRef)) {
             $script:RunState.Status = 'GameExitedBeforeWindow'
-            Save-RunState
             throw 'Endfield exited immediately after process creation; cleanup will close only this run launcher processes.'
         }
         $gameInfo = [HiddenDesktopNative]::ReadProcess($gameRef)
-        $script:RunState.Game = ConvertTo-Identity $gameInfo
         $script:RunState.ExpectedParentProcessId = [uint32]$parentInfo.ProcessId
-        $script:RunState.ParentPidObserved = [bool]($gameInfo.ParentProcessId -eq $parentInfo.ProcessId)
         $script:RunState.Status = 'GameCreated'
-        Save-RunState
         if (-not [string]::Equals([System.IO.Path]::GetFullPath($gameInfo.ImagePath), [System.IO.Path]::GetFullPath($paths.Game), [StringComparison]::OrdinalIgnoreCase) -or
             $gameInfo.SessionId -ne [uint32]$script:SessionId) {
             $script:RunState.Status = 'GameIdentityMismatch'
-            Save-RunState
             throw 'Endfield process image path or session did not match the selected installation; cleanup will close only this run launcher processes.'
         }
         if ($gameInfo.ParentProcessId -ne [uint32]$parentInfo.ProcessId) {
             $script:RunState.Status = 'GameParentMismatch'
-            Save-RunState
             throw 'Endfield observed parent PID did not match the selected Games.exe; cleanup will close only this run launcher processes.'
         }
         Write-RunStatus ("Game process created and verified: PID={0}, parent PID={1}, session={2}, image={3}. Waiting up to {4} seconds for a stable main window." -f $gameInfo.ProcessId, $gameInfo.ParentProcessId, $gameInfo.SessionId, $gameInfo.ImagePath, $GameWindowTimeoutSeconds)
         $script:RunState.Status = 'WaitingForGameWindow'
-        Save-RunState
         $windowTimeoutMilliseconds = $GameWindowTimeoutSeconds * 1000
         $windowWatch = [System.Diagnostics.Stopwatch]::StartNew()
         $windowResult = $null
         $finalWindowScan = $null
         $lastFinalWindowIssue = ''
+        $lastLoggedFinalWindowIssue = ''
         while ($windowWatch.ElapsedMilliseconds -lt $windowTimeoutMilliseconds) {
             $remainingMilliseconds = [int]($windowTimeoutMilliseconds - $windowWatch.ElapsedMilliseconds)
             $windowResult = Wait-ForStableGameWindow $gameRef ([uint32]$gameInfo.ProcessId) $visibleDesktop $remainingMilliseconds
-            $script:RunState.GameWindowWait = [ordered]@{
-                Status = $windowResult.Status
-                ElapsedMilliseconds = [long]$windowWatch.ElapsedMilliseconds
-                Detail = $windowResult.Detail
-                LastIssue = $windowResult.LastIssue
-            }
-            Save-RunState
             if ($windowResult.Status -ne 'Stable') {
                 $statusMap = @{
                     Exited = 'GameExitedBeforeStableWindow'
@@ -1249,13 +1069,11 @@ function Invoke-ActualRun {
                     TimedOut = 'GameWindowTimeout'
                 }
                 $script:RunState.Status = $statusMap[$windowResult.Status]
-                Save-RunState
                 throw ("Game startup was not confirmed ({0}); this run's launcher processes will be cleaned up. {1}" -f $windowResult.Status, $windowResult.Detail)
             }
 
             if (-not [HiddenDesktopNative]::IsRunning($gameRef)) {
                 $script:RunState.Status = 'GameExitedBeforeCleanup'
-                Save-RunState
                 throw "Endfield exited after the stable-window check; this run's launcher processes will be cleaned up."
             }
             $finalGameInfo = [HiddenDesktopNative]::ReadProcess($gameRef)
@@ -1265,32 +1083,25 @@ function Invoke-ActualRun {
                 -not [string]::Equals([System.IO.Path]::GetFullPath($finalGameInfo.ImagePath), [System.IO.Path]::GetFullPath($paths.Game), [StringComparison]::OrdinalIgnoreCase) -or
                 $finalGameInfo.ParentProcessId -ne [uint32]$parentInfo.ProcessId) {
                 $script:RunState.Status = 'GameIdentityChangedBeforeCleanup'
-                Save-RunState
                 throw "Endfield process identity changed before launcher cleanup; this run's launcher processes will be cleaned up."
             }
             try { $finalWindowScan = [HiddenDesktopNative]::ReadGameWindowScan([uint32]$gameInfo.ProcessId, $visibleDesktop) }
             catch { $finalWindowScan = [pscustomobject]@{ Kind = 'Unknown'; Handle = [IntPtr]::Zero; Detail = $_.Exception.Message } }
             if ($finalWindowScan.Kind.ToString() -eq 'FailureDialog') {
                 $script:RunState.Status = 'GameFailureDialog'
-                Save-RunState
                 throw ("A game failure dialog appeared during final window validation: {0}" -f $finalWindowScan.Detail)
             }
             if ($finalWindowScan.Kind.ToString() -eq 'MainFound' -and $finalWindowScan.Handle -eq $windowResult.WindowHandle) { break }
 
             $lastFinalWindowIssue = '{0}: {1}' -f $finalWindowScan.Kind, $finalWindowScan.Detail
-            if ($lastFinalWindowIssue -ne $script:RunState.GameWindowFinalValidationLastIssue) {
-                $script:RunState.GameWindowFinalValidationLastIssue = $lastFinalWindowIssue
+            if ($lastFinalWindowIssue -ne $lastLoggedFinalWindowIssue) {
                 Write-RunStatus ("Final game-window query did not confirm the stable HWND; continuing within the timeout. {0}" -f $lastFinalWindowIssue)
+                $lastLoggedFinalWindowIssue = $lastFinalWindowIssue
             }
-            $script:RunState.GameWindowFinalValidationLastIssue = $lastFinalWindowIssue
-            Save-RunState
         }
         if (-not $windowResult -or $windowResult.Status -ne 'Stable' -or
             $finalWindowScan.Kind.ToString() -ne 'MainFound' -or $finalWindowScan.Handle -ne $windowResult.WindowHandle) {
             $script:RunState.Status = 'GameWindowTimeout'
-            $script:RunState.GameWindowWait.Status = 'TimedOut'
-            if ($lastFinalWindowIssue) { $script:RunState.GameWindowWait.Detail = 'Final window validation did not recover before timeout. Last query: ' + $lastFinalWindowIssue }
-            Save-RunState
             throw ("Game main window was not confirmed through final validation within {0} seconds. {1}" -f $GameWindowTimeoutSeconds, $lastFinalWindowIssue)
         }
         return (Complete-GameLaunch $paths $gameRef $gameInfo $windowResult.WindowHandle)
@@ -1314,7 +1125,7 @@ function Invoke-ActualRun {
             try { [void](Invoke-ThisRunProcessCleanup $paths) }
             catch {
                 $script:RunState.CleanupErrors += ('Launcher cleanup coordinator failed: ' + $_.Exception.Message)
-                try { Save-RunState; Write-RunStatus $script:RunState.CleanupErrors[-1] } catch { }
+                try { Write-RunStatus $script:RunState.CleanupErrors[-1] } catch { }
             }
         }
         if ($gameRef) { $gameRef.Dispose() }
@@ -1331,18 +1142,15 @@ try {
     $selectedModes = @()
     if ($CheckOnly) { $selectedModes += 'CheckOnly' }
     if ($SelfTest) { $selectedModes += 'SelfTest' }
-    if ($StopLastRun) { $selectedModes += 'StopLastRun' }
-    if ($selectedModes.Count -gt 1) { throw 'Choose only one of -CheckOnly, -SelfTest, or -StopLastRun.' }
+    if ($selectedModes.Count -gt 1) { throw 'Choose only one of -CheckOnly or -SelfTest.' }
     if ($CheckOnly) { $exitCode = Invoke-CheckOnly }
     elseif ($SelfTest) { $exitCode = Invoke-SelfTest }
-    elseif ($StopLastRun) { $exitCode = Invoke-StopLastRun }
     else { $exitCode = Invoke-ActualRun }
     exit $exitCode
 }
 catch {
-    if ($script:RunState -and $script:RunStatePath) {
+    if ($script:RunState) {
         try {
-            $script:RunState.FailureReason = $_.Exception.Message
             if ($script:RunState.Status -notin @(
                 'GamesDesktopMismatch', 'GamesDesktopChangedDuringDelay', 'GamesDesktopEvidenceTimeout',
                 'LauncherIdentityMismatch', 'GameExitedBeforeWindow', 'GameIdentityMismatch', 'GameParentMismatch',
@@ -1352,7 +1160,6 @@ catch {
             )) {
                 $script:RunState.Status = 'Failed'
             }
-            Save-RunState
             Write-RunStatus ("Run stopped: {0}" -f $_.Exception.Message)
         } catch { }
     }

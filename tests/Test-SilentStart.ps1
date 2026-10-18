@@ -19,7 +19,7 @@ function Assert([bool]$Condition, [string]$Message) {
 
 function Write-TestRunner([string]$Path) {
     $runner = @'
-param([switch]$StopLastRun)
+param()
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @"
 using System;
@@ -51,7 +51,6 @@ try {
         ChildPid = $child.Id
         ChildStartTimeUtcTicks = $child.StartTime.ToUniversalTime().Ticks
         ChildPath = $child.MainModule.FileName
-        StopLastRun = [bool]$StopLastRun
     }
     [IO.File]::WriteAllText($env:ENDFIELD_SILENT_START_TEST_RECORD, (ConvertTo-Json $record -Compress))
 }
@@ -92,7 +91,6 @@ function Invoke-LauncherCase([string]$Name, [string[]]$Arguments, [int]$Expected
             $recordedStartTicks = [long]$record.ChildStartTimeUtcTicks
             Assert ([Math]::Abs(($descendant.StartTime.ToUniversalTime().Ticks - $recordedStartTicks) / 10000.0) -lt 1000) "${Name}: descendant start time did not match the mock record."
             Assert ($record.ConsoleWindow -eq 0) "${Name}: mock PowerShell has a console window handle ($($record.ConsoleWindow))."
-            if ($Arguments.Count -gt 0) { Assert ($record.StopLastRun) "${Name}: -StopLastRun was not forwarded." }
             Assert ($watch.ElapsedMilliseconds -lt 8000) "${Name}: launcher did not finish promptly."
             Write-Host ("PASS: {0} returned {1} in {2} ms; mock PowerShell has no console and child PID {3} remains alive." -f $Name, $ExpectedExitCode, $watch.ElapsedMilliseconds, $record.ChildPid)
         }
@@ -172,7 +170,7 @@ try {
 
     Invoke-LauncherCase 'default-zero' @() 0 $true
     Invoke-LauncherCase 'default-nonzero' @() 37 $true
-    Invoke-LauncherCase 'stop-last-run' @('-stoplastrun') 0 $true
+    Invoke-LauncherCase 'unsupported-stop-option' @('-StopLastRun') 2 $false
     Invoke-LauncherCase 'unsupported-option' @('-SelfTest') 2 $false
 }
 finally {
@@ -182,7 +180,7 @@ finally {
         $allowedNames = @(
             'SilentStart.cs', 'Start-Endfield.ps1', 'test.manifest',
             'EndfieldSilentStart.exe', 'EndfieldSilentStart.log',
-            'default-zero.json', 'default-nonzero.json', 'stop-last-run.json', 'unsupported-option.json'
+            'default-zero.json', 'default-nonzero.json', 'unsupported-stop-option.json', 'unsupported-option.json'
         )
         foreach ($item in @(Get-ChildItem -LiteralPath $testDirectory -Force)) {
             if ($item.PSIsContainer -or $allowedNames -notcontains $item.Name) {

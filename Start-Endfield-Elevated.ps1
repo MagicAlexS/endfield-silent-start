@@ -1,10 +1,10 @@
 ﻿#requires -Version 5.1
-param([switch]$StopLastRun)
+param()
 
 $ErrorActionPreference = 'Stop'
+if ($args.Count -gt 0) { exit 2 }
 $runnerScript = Join-Path $PSScriptRoot 'Start-Endfield.ps1'
 $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $runnerScript + '"'
-if ($StopLastRun) { $arguments += ' -StopLastRun' }
 $exitCode = 1
 $child = $null
 try {

@@ -1,4 +1,4 @@
-# Local configuration and runtime state
+# Local configuration and generated files
 config.json
 last-run.txt
 run-*.json
