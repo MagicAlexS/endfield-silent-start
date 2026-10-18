@@ -2,7 +2,7 @@
 
 Windows 上的《明日方舟：终末地》静默启动工具。官方启动器在隐藏桌面运行，游戏显示在当前桌面；完成启动后关闭本轮启动器并退出工具，保留游戏进程。
 
-提供 PowerShell 脚本和可自行编译的无控制台 EXE 入口。无控制台入口仍会显示 Windows UAC 提权提示。运行信息只保存在内存中，不生成日志或状态文件，多次使用不会累积运行记录。
+提供 PowerShell 脚本、免编译的 VBS 入口和可自行编译的 EXE 入口。VBS 与 EXE 入口均隐藏控制台，并保留 Windows UAC 提权提示。运行信息只保存在内存中，不生成日志或状态文件，多次使用不会累积运行记录。
 
 ## 运行环境
 
@@ -28,7 +28,7 @@ Hypergryph Launcher/
     └── ...
 ```
 
-**自定义目录：** 工具也可以放在其他可写目录。复制 `config.example.json` 为 `config.json`，修改安装路径：
+**自定义目录：** 工具也可以放在其他目录。复制 `config.example.json` 为 `config.json`，修改安装路径：
 
 ```json
 {
@@ -46,7 +46,19 @@ Hypergryph Launcher/
 
 ## 使用
 
-### 无控制台启动
+### VBS 启动（免编译）
+
+系统启用 Windows Script Host 和 VBScript 时，可以直接双击 `Start-Endfield.vbs`，在 UAC 提示中确认，无需编译 EXE。VBS 会隐藏启动 64 位 PowerShell；游戏仍显示在当前桌面。
+
+也可以显式使用 Windows 脚本宿主运行：
+
+```cmd
+wscript.exe Start-Endfield.vbs
+```
+
+VBS 需要与 `Start-Endfield.ps1`、`HiddenDesktopNative.cs` 放在同一目录，自定义安装路径仍使用 `config.json`。VBS 发起启动后即退出，后续等待和清理由 PowerShell 脚本完成；它不传递主脚本的最终退出码。
+
+### EXE 启动
 
 先按下文编译 EXE，然后双击 `EndfieldSilentStart.exe`，在 UAC 提示中确认。启动过程不显示 CMD 或 PowerShell 控制台。
 
@@ -115,6 +127,7 @@ HiddenDesktopNative.cs
 .\tests\Test-NoState.ps1
 .\tests\Test-ConsoleExit.ps1
 .\tests\Test-SilentStart.ps1
+.\tests\Test-VbsStart.ps1
 ```
 
 `-CheckOnly` 检查配置、路径及进程状态；其余检查使用临时模拟进程，不启动真实游戏。
