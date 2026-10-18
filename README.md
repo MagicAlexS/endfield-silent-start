@@ -2,7 +2,7 @@
 
 Windows 上的《明日方舟：终末地》静默启动工具。官方启动器在隐藏桌面运行，游戏显示在当前桌面；完成启动后关闭本轮启动器并退出工具，保留游戏进程。
 
-提供 PowerShell 脚本、免编译的 VBS 入口和可自行编译的 EXE 入口。VBS 与 EXE 入口均隐藏控制台，并保留 Windows UAC 提权提示。运行信息只保存在内存中，不生成日志或状态文件，多次使用不会累积运行记录。
+提供 PowerShell 脚本、免编译的 VBS 入口和可自行编译的 EXE 入口。VBS 与 EXE 入口均隐藏控制台，并保留 Windows UAC 提权提示。
 
 ## 运行环境
 
@@ -46,7 +46,7 @@ Hypergryph Launcher/
 
 ## 使用
 
-### VBS 启动（免编译）
+### VBS 启动
 
 系统启用 Windows Script Host 和 VBScript 时，可以直接双击 `Start-Endfield.vbs`，在 UAC 提示中确认，无需编译 EXE。VBS 会隐藏启动 64 位 PowerShell；游戏仍显示在当前桌面。
 
